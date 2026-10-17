@@ -1,0 +1,538 @@
+name: Enterprise DevSecOps QA CI/CD
+
+on:
+  push:
+    branches:
+      - qa
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'k8-manifests/qa/backend.yaml'
+      - 'k8-manifests/qa/frontend.yaml'
+      - 'k8-manifests/qa/ingress.yaml'
+      - '.github/workflows/qa-cicd.yaml'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-south-1
+  EKS_CLUSTER_NAME: my-cluster
+  K8S_NAMESPACE: qa
+  BACKEND_REPO: projectops-backend
+  FRONTEND_REPO: projectops-frontend
+
+jobs:
+
+  gitleaks-scan:
+    name: Gitleaks Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Run Gitleaks scan
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/repo" \
+            zricethezav/gitleaks:latest detect \
+            --source=/repo \
+            --report-format=json \
+            --report-path=/repo/gitleaks-report.json \
+            --redact \
+            --exit-code 0
+
+      - name: Upload Gitleaks report
+        uses: actions/upload-artifact@v7
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          if-no-files-found: warn
+
+  semgrep-scan:
+    name: Semgrep SAST Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep scan
+        run: |
+          semgrep scan \
+            --config auto \
+            ./backend \
+            ./frontend \
+            --json \
+            --output semgrep-report.json || true
+
+      - name: Upload Semgrep report
+        uses: actions/upload-artifact@v7
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          if-no-files-found: warn
+
+  checkov-k8s:
+    name: Checkov Kubernetes Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Run Checkov Kubernetes scan
+        run: |
+          checkov -d k8-manifests/qa \
+            --framework kubernetes \
+            --output json > checkov-k8s-report.json || true
+
+      - name: Upload Checkov Kubernetes report
+        uses: actions/upload-artifact@v7
+        with:
+          name: checkov-k8s-report
+          path: checkov-k8s-report.json
+          if-no-files-found: warn
+
+  checkov-dockerfile:
+    name: Checkov Dockerfile Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Run Checkov Dockerfile scan
+        run: |
+          checkov -d . \
+            --framework dockerfile \
+            --output json > checkov-dockerfile-report.json || true
+
+      - name: Upload Checkov Dockerfile report
+        uses: actions/upload-artifact@v7
+        with:
+          name: checkov-dockerfile-report
+          path: checkov-dockerfile-report.json
+          if-no-files-found: warn
+
+  backend-test:
+    name: Backend - Maven Test + Trivy FS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+
+      - name: Run backend tests
+        working-directory: backend
+        run: mvn -B clean verify
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          version: latest
+          cache: true
+
+      - name: Trivy FS scan - backend
+        run: |
+          trivy fs ./backend \
+            --offline-scan \
+            --format json \
+            --output backend-trivy-fs-report.json \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 0
+
+      - name: Upload backend Trivy report
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-trivy-fs-report
+          path: backend-trivy-fs-report.json
+          if-no-files-found: warn
+
+  frontend-build:
+    name: Frontend - Trivy FS + Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          version: latest
+          cache: true
+
+      - name: Trivy FS scan - frontend
+        run: |
+          trivy fs ./frontend \
+            --format json \
+            --output frontend-trivy-fs-report.json \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 0
+
+      - name: Upload frontend Trivy report
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-trivy-fs-report
+          path: frontend-trivy-fs-report.json
+          if-no-files-found: warn
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs:
+      - backend-test
+      - frontend-build
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+
+      - name: Compile backend for SonarQube
+        working-directory: backend
+        run: mvn -B clean verify
+
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        with:
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY || github.event.repository.name }}
+            -Dsonar.projectName=${{ github.event.repository.name }}
+            -Dsonar.sources=backend/src/main/java,frontend/src
+            -Dsonar.tests=backend/src/test/java
+            -Dsonar.java.binaries=backend/target/classes
+            -Dsonar.exclusions=frontend/node_modules/**,frontend/dist/**
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
+        continue-on-error: true
+        with:
+          pollingTimeoutSec: 600
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  docker:
+    name: Build, Scan and Push Backend + Frontend to ECR
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    needs:
+      - gitleaks-scan
+      - semgrep-scan
+      - checkov-k8s
+      - checkov-dockerfile
+      - backend-test
+      - frontend-build
+
+    outputs:
+      image_tag: ${{ steps.image-meta.outputs.image_tag }}
+      backend_image: ${{ steps.image-meta.outputs.backend_image }}
+      frontend_image: ${{ steps.image-meta.outputs.frontend_image }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Show GitHub Repository IDs
+        run: |
+          echo "Repository: ${{ github.repository }}"
+          echo "Repository ID: ${{ github.repository_id }}"
+          echo "Owner: ${{ github.repository_owner }}"
+          echo "Owner ID: ${{ github.repository_owner_id }}"
+          echo "Ref: ${{ github.ref }}"
+
+      - name: Configure AWS credentials from GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_QA_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image names
+        id: image-meta
+        shell: bash
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="qa-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}"
+
+          BACKEND_IMAGE="$REGISTRY/$BACKEND_REPO:$IMAGE_TAG"
+          FRONTEND_IMAGE="$REGISTRY/$FRONTEND_REPO:$IMAGE_TAG"
+
+          echo "REGISTRY=$REGISTRY" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=$FRONTEND_IMAGE" >> "$GITHUB_ENV"
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "backend_image=$BACKEND_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "frontend_image=$FRONTEND_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./backend
+          load: true
+          push: false
+          tags: ${{ steps.image-meta.outputs.backend_image }}
+          cache-from: type=gha,scope=projectops-backend
+          cache-to: type=gha,mode=max,scope=projectops-backend
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          load: true
+          push: false
+          tags: ${{ steps.image-meta.outputs.frontend_image }}
+          cache-from: type=gha,scope=projectops-frontend
+          cache-to: type=gha,mode=max,scope=projectops-frontend
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          version: latest
+          cache: true
+
+      - name: Scan backend image
+        run: |
+          trivy image "$BACKEND_IMAGE" \
+            --format json \
+            --output backend-image-trivy-report.json \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 0
+
+      - name: Scan frontend image
+        run: |
+          trivy image "$FRONTEND_IMAGE" \
+            --format json \
+            --output frontend-image-trivy-report.json \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 0
+
+      - name: Upload image scan reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-image-reports
+          path: |
+            backend-image-trivy-report.json
+            frontend-image-trivy-report.json
+          if-no-files-found: warn
+
+      - name: Generate backend image SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.image-meta.outputs.backend_image }}
+          format: spdx-json
+          output-file: backend-image-sbom.spdx.json
+          upload-artifact: true
+
+      - name: Generate frontend image SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.image-meta.outputs.frontend_image }}
+          format: spdx-json
+          output-file: frontend-image-sbom.spdx.json
+          upload-artifact: true
+
+      - name: Push backend image to ECR
+        run: docker push "$BACKEND_IMAGE"
+
+      - name: Push frontend image to ECR
+        run: docker push "$FRONTEND_IMAGE"
+
+  update-qa-manifests:
+    name: Update QA Manifests with ECR Images
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    needs: docker
+
+    steps:
+      - name: Checkout QA branch
+        uses: actions/checkout@v7
+        with:
+          ref: qa
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update backend and frontend image references
+        env:
+          BACKEND_IMAGE: ${{ needs.docker.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ needs.docker.outputs.frontend_image }}
+        run: |
+          sed -Ei "s|^([[:space:]]*)image:.*|\1image: ${BACKEND_IMAGE}|" \
+            k8-manifests/qa/backend.yaml
+
+          sed -Ei "s|^([[:space:]]*)image:.*|\1image: ${FRONTEND_IMAGE}|" \
+            k8-manifests/qa/frontend.yaml
+
+          echo "Backend image:"
+          grep -m1 "image:" k8-manifests/qa/backend.yaml
+
+          echo "Frontend image:"
+          grep -m1 "image:" k8-manifests/qa/frontend.yaml
+
+      - name: Commit updated QA manifests
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            k8-manifests/qa/backend.yaml \
+            k8-manifests/qa/frontend.yaml
+
+          git commit \
+            -m "Update QA ECR images to ${{ needs.docker.outputs.image_tag }} [skip ci]" \
+            || echo "No changes to commit"
+
+          git push origin qa
+
+  deploy-to-k8s:
+    name: Deploy Backend + Frontend + Ingress to QA EKS
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    needs: update-qa-manifests
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+        with:
+          ref: qa
+
+      - name: Configure AWS credentials from GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_QA_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Generate kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Verify AWS and namespace access
+        run: |
+          aws sts get-caller-identity
+
+          kubectl auth can-i create deployments \
+            -n "$K8S_NAMESPACE"
+
+          kubectl auth can-i create services \
+            -n "$K8S_NAMESPACE"
+
+          kubectl auth can-i create ingresses.networking.k8s.io \
+            -n "$K8S_NAMESPACE"
+
+      - name: Deploy QA application
+        run: |
+          kubectl apply -f k8-manifests/qa/backend.yaml
+          kubectl apply -f k8-manifests/qa/frontend.yaml
+          kubectl apply -f k8-manifests/qa/ingress.yaml
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/backend \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+          kubectl rollout status deployment/frontend \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+      - name: Show QA resources
+        run: |
+          kubectl get pods -n "$K8S_NAMESPACE" -o wide
+          kubectl get services -n "$K8S_NAMESPACE"
+          kubectl get ingress -n "$K8S_NAMESPACE"

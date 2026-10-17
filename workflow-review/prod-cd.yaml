@@ -1,0 +1,546 @@
+name: Enterprise Production CD Pipeline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  EKS_CLUSTER_NAME: my-cluster
+  K8S_NAMESPACE: prod
+
+  BACKEND_REPO: projectops-backend
+  FRONTEND_REPO: projectops-frontend
+
+
+jobs:
+
+  # ============================================================
+  # 1. PROMOTE TESTED QA IMAGES TO PROD
+  # ============================================================
+  promote-images-to-prod:
+    name: Promote QA Images to Production
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      prod_tag: ${{ steps.prod-meta.outputs.prod_tag }}
+      backend_prod_image: ${{ steps.prod-meta.outputs.backend_prod_image }}
+      frontend_prod_image: ${{ steps.prod-meta.outputs.frontend_prod_image }}
+
+    steps:
+
+      # ----------------------------------------------------------
+      # Checkout QA branch
+      # ----------------------------------------------------------
+      - name: Checkout QA branch
+        uses: actions/checkout@v7
+        with:
+          ref: qa
+          path: qa-source
+          fetch-depth: 0
+
+
+      # ----------------------------------------------------------
+      # GitHub OIDC -> Production IAM Role
+      # ----------------------------------------------------------
+      - name: Configure AWS credentials from GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      # ----------------------------------------------------------
+      # Verify assumed AWS identity
+      # ----------------------------------------------------------
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+
+      # ----------------------------------------------------------
+      # Login to Amazon ECR
+      # ----------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      # ----------------------------------------------------------
+      # Verify QA manifests
+      # ----------------------------------------------------------
+      - name: Verify QA manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f qa-source/k8-manifests/qa/backend.yaml
+          test -f qa-source/k8-manifests/qa/frontend.yaml
+
+          echo "QA backend manifest found"
+          echo "QA frontend manifest found"
+
+
+      # ----------------------------------------------------------
+      # Read exact images that were tested in QA
+      # ----------------------------------------------------------
+      - name: Read QA image references
+        id: qa-images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BACKEND_QA_IMAGE=$(awk \
+            '/^[[:space:]]*image:/ {print $2; exit}' \
+            qa-source/k8-manifests/qa/backend.yaml)
+
+          FRONTEND_QA_IMAGE=$(awk \
+            '/^[[:space:]]*image:/ {print $2; exit}' \
+            qa-source/k8-manifests/qa/frontend.yaml)
+
+          if [ -z "$BACKEND_QA_IMAGE" ]; then
+            echo "ERROR: Backend QA image not found"
+            exit 1
+          fi
+
+          if [ -z "$FRONTEND_QA_IMAGE" ]; then
+            echo "ERROR: Frontend QA image not found"
+            exit 1
+          fi
+
+          echo "Backend QA image: $BACKEND_QA_IMAGE"
+          echo "Frontend QA image: $FRONTEND_QA_IMAGE"
+
+          echo "backend_qa_image=$BACKEND_QA_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "frontend_qa_image=$FRONTEND_QA_IMAGE" >> "$GITHUB_OUTPUT"
+
+
+      # ----------------------------------------------------------
+      # Generate immutable production image tag
+      # ----------------------------------------------------------
+      - name: Generate production image names
+        id: prod-meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          PROD_TAG="prod-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}"
+
+          BACKEND_PROD_IMAGE="$REGISTRY/$BACKEND_REPO:$PROD_TAG"
+          FRONTEND_PROD_IMAGE="$REGISTRY/$FRONTEND_REPO:$PROD_TAG"
+
+          echo "PROD_TAG=$PROD_TAG" >> "$GITHUB_ENV"
+          echo "BACKEND_PROD_IMAGE=$BACKEND_PROD_IMAGE" >> "$GITHUB_ENV"
+          echo "FRONTEND_PROD_IMAGE=$FRONTEND_PROD_IMAGE" >> "$GITHUB_ENV"
+
+          echo "prod_tag=$PROD_TAG" >> "$GITHUB_OUTPUT"
+          echo "backend_prod_image=$BACKEND_PROD_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "frontend_prod_image=$FRONTEND_PROD_IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "Production tag: $PROD_TAG"
+          echo "Backend PROD image: $BACKEND_PROD_IMAGE"
+          echo "Frontend PROD image: $FRONTEND_PROD_IMAGE"
+
+
+      # ----------------------------------------------------------
+      # Pull already tested QA images
+      # ----------------------------------------------------------
+      - name: Pull QA images from ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker pull "${{ steps.qa-images.outputs.backend_qa_image }}"
+          docker pull "${{ steps.qa-images.outputs.frontend_qa_image }}"
+
+
+      # ----------------------------------------------------------
+      # Retag SAME QA images for production
+      # No rebuilding
+      # ----------------------------------------------------------
+      - name: Retag QA images for production
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker tag \
+            "${{ steps.qa-images.outputs.backend_qa_image }}" \
+            "$BACKEND_PROD_IMAGE"
+
+          docker tag \
+            "${{ steps.qa-images.outputs.frontend_qa_image }}" \
+            "$FRONTEND_PROD_IMAGE"
+
+
+      # ----------------------------------------------------------
+      # Push production tags to ECR
+      # ----------------------------------------------------------
+      - name: Push production images to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker push "$BACKEND_PROD_IMAGE"
+          docker push "$FRONTEND_PROD_IMAGE"
+
+
+
+  # ============================================================
+  # 2. UPDATE PROD KUBERNETES MANIFESTS
+  # ============================================================
+  update-prod-manifests:
+    name: Update Production Manifests
+
+    needs:
+      - promote-images-to-prod
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+
+      # ----------------------------------------------------------
+      # Checkout MAIN branch
+      # ----------------------------------------------------------
+      - name: Checkout main branch
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+
+      # ----------------------------------------------------------
+      # Verify production manifests
+      # ----------------------------------------------------------
+      - name: Verify production manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Branch:"
+          git branch --show-current
+
+          echo
+          echo "Commit:"
+          git log -1 --oneline
+
+          echo
+          echo "Production manifests:"
+          ls -la k8-manifests/prod/
+
+          test -f k8-manifests/prod/backend.yaml
+          test -f k8-manifests/prod/frontend.yaml
+
+          echo "backend.yaml found"
+          echo "frontend.yaml found"
+
+
+      # ----------------------------------------------------------
+      # Replace image references with PROD image tags
+      # ----------------------------------------------------------
+      - name: Update backend and frontend production images
+        shell: bash
+
+        env:
+          BACKEND_PROD_IMAGE: ${{ needs.promote-images-to-prod.outputs.backend_prod_image }}
+          FRONTEND_PROD_IMAGE: ${{ needs.promote-images-to-prod.outputs.frontend_prod_image }}
+
+        run: |
+          set -euo pipefail
+
+          sed -Ei \
+            "s|^([[:space:]]*)image:.*|\1image: ${BACKEND_PROD_IMAGE}|" \
+            k8-manifests/prod/backend.yaml
+
+          sed -Ei \
+            "s|^([[:space:]]*)image:.*|\1image: ${FRONTEND_PROD_IMAGE}|" \
+            k8-manifests/prod/frontend.yaml
+
+
+      # ----------------------------------------------------------
+      # Verify updated image references
+      # ----------------------------------------------------------
+      - name: Show updated production images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Backend:"
+          grep -m1 "image:" k8-manifests/prod/backend.yaml
+
+          echo
+          echo "Frontend:"
+          grep -m1 "image:" k8-manifests/prod/frontend.yaml
+
+
+      # ----------------------------------------------------------
+      # Commit updated manifests to main
+      # ----------------------------------------------------------
+      - name: Commit updated production manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            k8-manifests/prod/backend.yaml \
+            k8-manifests/prod/frontend.yaml
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit"
+          else
+            git commit \
+              -m "Promote images to ${{ needs.promote-images-to-prod.outputs.prod_tag }} [skip ci]"
+
+            git push origin main
+          fi
+
+
+
+  # ============================================================
+  # 3. DEPLOY TO PRODUCTION EKS
+  # ============================================================
+  deploy-to-prod:
+    name: Deploy to Production EKS
+
+    needs:
+      - update-prod-manifests
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+
+      # ----------------------------------------------------------
+      # Checkout latest MAIN
+      # ----------------------------------------------------------
+      - name: Checkout latest main branch
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+
+      # ----------------------------------------------------------
+      # Verify deployment manifests exist
+      # ----------------------------------------------------------
+      - name: Verify production manifest directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Production manifests:"
+          ls -la k8-manifests/prod/
+
+          test -f k8-manifests/prod/backend.yaml
+          test -f k8-manifests/prod/frontend.yaml
+          test -f k8-manifests/prod/ingress.yaml
+
+
+      # ----------------------------------------------------------
+      # GitHub OIDC -> GitHubActionsEKSProdRole
+      # ----------------------------------------------------------
+      - name: Configure AWS credentials from GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      # ----------------------------------------------------------
+      # Verify assumed IAM Role
+      # ----------------------------------------------------------
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+
+      # ----------------------------------------------------------
+      # Install kubectl
+      # ----------------------------------------------------------
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+
+      # ----------------------------------------------------------
+      # Generate kubeconfig
+      #
+      # Requires:
+      # eks:DescribeCluster
+      # ----------------------------------------------------------
+      - name: Generate kubeconfig for EKS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+
+      # ----------------------------------------------------------
+      # Verify namespace access
+      #
+      # IMPORTANT:
+      # Do NOT use:
+      #
+      # kubectl cluster-info
+      # kubectl get nodes
+      #
+      # because this PROD role is intentionally scoped only
+      # to the prod namespace.
+      # ----------------------------------------------------------
+      - name: Verify PROD namespace access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking access to namespace: $K8S_NAMESPACE"
+
+          kubectl get pods \
+            -n "$K8S_NAMESPACE"
+
+          kubectl get services \
+            -n "$K8S_NAMESPACE"
+
+
+      # ----------------------------------------------------------
+      # Verify required Kubernetes permissions
+      # ----------------------------------------------------------
+      - name: Verify Kubernetes deployment permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_permission() {
+
+            RESOURCE="$1"
+
+            RESULT=$(kubectl auth can-i create "$RESOURCE" \
+              -n "$K8S_NAMESPACE")
+
+            echo "$RESOURCE -> $RESULT"
+
+            if [ "$RESULT" != "yes" ]; then
+              echo "ERROR: Missing permission to create $RESOURCE"
+              exit 1
+            fi
+          }
+
+          check_permission deployments
+          check_permission services
+          check_permission configmaps
+          check_permission secrets
+          check_permission ingresses.networking.k8s.io
+
+
+      # ----------------------------------------------------------
+      # Show exact images before deployment
+      # ----------------------------------------------------------
+      - name: Show production images before deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Backend image:"
+          grep -m1 "image:" \
+            k8-manifests/prod/backend.yaml
+
+          echo
+          echo "Frontend image:"
+          grep -m1 "image:" \
+            k8-manifests/prod/frontend.yaml
+
+
+      # ----------------------------------------------------------
+      # Deploy PROD manifests
+      # ----------------------------------------------------------
+      - name: Deploy production manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl apply \
+            -f k8-manifests/prod/
+
+
+      # ----------------------------------------------------------
+      # Verify backend rollout
+      # ----------------------------------------------------------
+      - name: Verify backend rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl rollout status deployment/backend \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+
+      # ----------------------------------------------------------
+      # Verify frontend rollout
+      # ----------------------------------------------------------
+      - name: Verify frontend rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl rollout status deployment/frontend \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+
+      # ----------------------------------------------------------
+      # Show final production resources
+      # ----------------------------------------------------------
+      - name: Show production resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "====================================="
+          echo "PODS"
+          echo "====================================="
+
+          kubectl get pods \
+            -n "$K8S_NAMESPACE" \
+            -o wide
+
+
+          echo
+          echo "====================================="
+          echo "SERVICES"
+          echo "====================================="
+
+          kubectl get services \
+            -n "$K8S_NAMESPACE"
+
+
+          echo
+          echo "====================================="
+          echo "INGRESS"
+          echo "====================================="
+
+          kubectl get ingress \
+            -n "$K8S_NAMESPACE"
